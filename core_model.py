@@ -4,6 +4,25 @@ import sonnet as snt
 from normalization import Normalizer
 
 
+def deterministic_segment_sum(values, indices, num_segments):
+    """Deterministic equivalent of unsorted_segment_sum using matmul."""
+    segment_map = tf.one_hot(indices, depth=num_segments, dtype=values.dtype)
+    flat_values = tf.reshape(values, [tf.shape(values)[0], -1])
+    reduced = tf.matmul(segment_map, flat_values, transpose_a=True)
+    output_shape = tf.concat([[num_segments], tf.shape(values)[1:]], axis=0)
+    return tf.reshape(reduced, output_shape)
+
+
+def deterministic_gather(values, indices):
+    """Deterministic row gather using one-hot projection."""
+    num_rows = tf.shape(values)[0]
+    selector = tf.one_hot(indices, depth=num_rows, dtype=values.dtype)
+    flat_values = tf.reshape(values, [num_rows, -1])
+    gathered = tf.matmul(selector, flat_values)
+    output_shape = tf.concat([[tf.shape(indices)[0]], tf.shape(values)[1:]], axis=0)
+    return tf.reshape(gathered, output_shape)
+
+
 class FFN(snt.Module):
     def __init__(self, hidden_size, name=None):
         super(FFN, self).__init__(name=name)
@@ -104,9 +123,9 @@ class MultiHeadAttentionCnt(snt.Module):
 
 
     def propagate_attention(self, num_nodes, Q_h, K_h, V_h, G_h, proj_e, senders, receivers):
-        q = tf.gather(K_h, senders)
-        k = tf.gather(Q_h, receivers)
-        v = tf.gather(V_h, senders)
+        q = deterministic_gather(K_h, senders)
+        k = deterministic_gather(Q_h, receivers)
+        v = deterministic_gather(V_h, senders)
         
         scale_factor = tf.sqrt(tf.cast(self.out_dim, dtype=tf.float32))
         score = tf.multiply(q, k) / scale_factor
@@ -117,7 +136,7 @@ class MultiHeadAttentionCnt(snt.Module):
         attention_scores = tf.exp(score)
         v = tf.multiply(v, G_h)
 
-        h_node = tf.math.unsorted_segment_sum(tf.multiply(v, attention_scores), receivers, num_nodes) 
+        h_node = deterministic_segment_sum(tf.multiply(v, attention_scores), receivers, num_nodes)
         h_node = tf.reshape(h_node, [-1, self.latent_size])
 
         return h_node
@@ -202,9 +221,9 @@ class MultiHeadAttentionMesh(snt.Module):
 
 
     def single_propagate_attention(self, num_nodes, Q_h, K_h, V_h, G_h, proj, senders, receivers):
-        q = tf.gather(K_h, senders)
-        k = tf.gather(Q_h, receivers)
-        v = tf.gather(V_h, senders)
+        q = deterministic_gather(K_h, senders)
+        k = deterministic_gather(Q_h, receivers)
+        v = deterministic_gather(V_h, senders)
         
         scale_factor = tf.sqrt(tf.cast(self.out_dim, dtype=tf.float32))
         score = tf.multiply(q, k) / scale_factor
@@ -216,7 +235,7 @@ class MultiHeadAttentionMesh(snt.Module):
 
         v = tf.multiply(v, G_h)
 
-        h_node = tf.math.unsorted_segment_sum(tf.multiply(v, attention_scores), receivers, num_nodes) 
+        h_node = deterministic_segment_sum(tf.multiply(v, attention_scores), receivers, num_nodes)
 
         h_node = tf.reshape(h_node, [-1, self.latent_size])
 
@@ -276,7 +295,7 @@ class GraphTransformerEdge(snt.Module):
 
 
 class HCMT(snt.Module):
-    def __init__(self, name='HierarchyMeshTransformer'):
+    def __init__(self, hierarchy_levels=7, name='HierarchyMeshTransformer'):
         super(HCMT, self).__init__(name=name)
 
         """ Parameters """
@@ -286,18 +305,21 @@ class HCMT(snt.Module):
         num_heads = 4
 
         self.encoder_node = EncoderNode(num_layers, latent_size)
-        self.encoder_edge_mesh = EncoderEdgeMesh(num_layers, latent_size, 6)
-        self.encoder_edge_cnt  = EncoderEdgeCnt(num_layers, latent_size, 3)
+        self.encoder_edge_mesh = EncoderEdgeMesh(num_layers, latent_size, 8)
+        self.encoder_edge_cnt  = EncoderEdgeCnt(num_layers, latent_size, 4)
         self.decoder = MLP(num_layers, latent_size, output_size, layer_norm=False, name='decoder')
 
-        self.l_n = 6
+        if hierarchy_levels < 1:
+            raise ValueError('hierarchy_levels must be at least 1.')
+
+        self.l_n = hierarchy_levels - 1
 
         self.downs = [GraphTransformerEdge(latent_size, num_heads) for _ in range(self.l_n)]
         self.bottom = GraphTransformerEdge(latent_size, num_heads)
         self.ups = [GraphTransformerEdge(latent_size, num_heads) for _ in range(self.l_n)]
 
-        self.firsts = [GraphTransformerCnt(latent_size, num_heads) for _ in range(2)]
-        print('hierarchy level', self.l_n)
+        self.firsts = [GraphTransformerCnt(latent_size, num_heads) for _ in range(10)]
+        print('hierarchy levels', hierarchy_levels)
 
 
     def __call__(self, node_features, inputs, edges, is_training):
@@ -327,7 +349,7 @@ class HCMT(snt.Module):
         for i in range(self.l_n):
             # Pool
             idx = inputs['m_ids'][i]
-            V = tf.gather(V, idx)
+            V = deterministic_gather(V, idx)
 
             senders = inputs['m_gs_s'][i]
             receivers = inputs['m_gs_r'][i]
@@ -346,7 +368,7 @@ class HCMT(snt.Module):
 
         # Bottom
         idx = inputs['m_ids'][i + 1]
-        V = tf.gather(V, idx)
+        V = deterministic_gather(V, idx)
         senders = inputs['m_gs_s'][i + 1]
         receivers = inputs['m_gs_r'][i + 1]
         world_pos = tf.gather(world_pos, idx)
